@@ -1,12 +1,9 @@
 """
 pl_simple_baseline.py
 
-A minimal PyTorch Lightning wrapper for training a solar-wind speed regression model.
+A minimal PyTorch Lightning wrapper for training a flare prediction model.
 
-The original flare-forecasting version of this file (``FlareLightningModule``) is
-preserved in ``pl_simple_baseline_flare_backup.py`` for reference.
-
-This module defines a single LightningModule (SolarWindLightningModule) that:
+This module defines a single LightningModule (FlareLightningModule) that:
   - Calls a user-provided PyTorch model on batched inputs (batch["ts"])
   - Computes one or more training/validation losses via a user-provided loss function
   - Logs scalar losses and evaluation metrics using Lightning's built-in logging
@@ -56,9 +53,9 @@ MetricDict = Mapping[str, torch.Tensor]
 Weights = Any  # often a list[float] or list[torch.Tensor]
 
 
-class SolarWindLightningModule(L.LightningModule):
+class FlareLightningModule(L.LightningModule):
     """
-    PyTorch LightningModule for solar-wind speed regression training.
+    PyTorch LightningModule for flare prediction training.
 
     This class wraps:
       (1) a user-provided PyTorch model (nn.Module-like) and

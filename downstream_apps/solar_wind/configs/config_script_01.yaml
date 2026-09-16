@@ -44,13 +44,15 @@ data:
   time_delta_target_minutes: 60   # Step size (minutes) between forecast frames
 
   # -- Downstream label alignment (OMNI solar wind index → Surya index) --
-  # Small samples drawn from the nasa-ibm-ai4science/Surya-bench-solarwind HF dataset
-  # (hourly OMNI, already cleaned — no fill-value sentinels), restricted to rows that
-  # actually match a present=1 Surya frame within ds_time_tolerance. The original raw
-  # OMNI 2012 csvs (a year Surya's SDO index has zero frames for, so no row could ever
-  # match) are preserved as solar_wind_{train,val}_omni2012_backup.csv for reference.
-  ds_train_index_path: ../data/solar_wind_train.csv
-  ds_val_index_path: ../data/solar_wind_val.csv
+  # Full nasa-ibm-ai4science/Surya-bench-solarwind HF dataset (hourly OMNI, already
+  # cleaned — no fill-value sentinels): ~70k train rows / ~3.4k val rows, 2010-2019.
+  # Fetch with ./download_solar_wind_dataset.sh. SolarWindDSDataset matches these against
+  # the Surya S3 index at construction time (merge_asof within ds_time_tolerance), so only
+  # rows with a present=1 Surya frame within tolerance end up used. A hand-picked small
+  # sample (solar_wind_{train,val}.csv) and the raw, non-overlapping 2012 OMNI csvs are
+  # kept in ../data/ for reference.
+  ds_train_index_path: ../data/hf_solar_wind/train.csv
+  ds_val_index_path: ../data/hf_solar_wind/validation.csv
   # "timestamp" is the hourly OMNI observation time (already point-in-time; this
   # benchmark dataset does not carry a separate travel-time-corrected column).
   ds_time_column: timestamp
@@ -109,7 +111,7 @@ data:
   s3_boto3_part_size_mb: 64       # part size in MB (benchmark default: 64)
 
   # -- Development --
-  max_samples: 10                 # Cap dataset size for quick experiments (null = all samples)
+  max_samples: null                # Cap dataset size for quick experiments (null = all samples)
 
 
 # -----------------------------------------------------------------------------
@@ -136,26 +138,32 @@ model:
   init_weights: false
   checkpoint_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
   ensemble: null
-  nglo: 1
   time_embedding:
     type: linear        # Options: linear | fourier | perceiver
     n_queries: null     # Required for perceiver; unused otherwise
     time_dim: 1         # Number of input timesteps (must match time_delta_input_minutes length)
 
   # -- Fine-tuning head --
+  # Head layers live on the model as head_* attributes; see ADAPTING.md before adding one.
   pooling: class_token  # Options: class_token | global_average | global_max | attention | transformer
   penultimate_linear_layer: true
   dropout: 0.2
   freeze_backbone: false
 
   # -- LoRA adapters --
+  # Trainable under use_lora: true = these adapters + every head_* module.
+  # The head is discovered automatically from the head_ naming convention.
   use_lora: true
   lora_config:
     r: 8
     lora_alpha: 8
     lora_dropout: 0.1
     bias: none
-    target_modules: [q_proj, v_proj, k_proj, out_proj, fc1, fc2]
+    # fc1/fc2 in all 10 blocks; attn.qkv/attn.proj in the 8 attention blocks.
+    # Dotted names are required: a bare "proj" would also match the Conv2d
+    # patch-embedding tokeniser. Never adapted: the spectral complex_weight,
+    # attn.to_dynamic_projection, and the patch embedding.
+    target_modules: [fc1, fc2, attn.qkv, attn.proj]
 
 
 # -----------------------------------------------------------------------------
@@ -219,5 +227,5 @@ output:
 # Logging
 # -----------------------------------------------------------------------------
 logging:
-  wandb_project: template_solar_wind_regression
+  wandb_project: solar_wind_regression
   wandb_entity: null      # WandB team/org name; null to log to your personal account

@@ -10,8 +10,8 @@ Design goals
 Assumptions
 - Assets (`scalers.yaml` + model weights) are downloaded automatically on first run.
 - You run this script from the repo root and specify devices via CUDA_VISIBLE_DEVICES:
-    CUDA_VISIBLE_DEVICES=0,1 python -m downstream_apps.template.3_finetune_template_1D \
-        --config downstream_apps/template/configs/config_script.yaml
+    CUDA_VISIBLE_DEVICES=0,1 python -m downstream_apps.solar_wind.3_finetune_template_1D \
+        --config downstream_apps/solar_wind/configs/config_script_01.yaml
 
 All parameters live in the YAML. The CLI overrides only what genuinely varies between
 runs of the same config: --max-epochs and --batch-size (sweeps), --s3-cache-dir
@@ -42,10 +42,10 @@ from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
-from downstream_apps.template.configs import TrainingConfig, load_flare_config
-from downstream_apps.template.datasets.template_dataset import FlareDSDataset
-from downstream_apps.template.lightning_modules.pl_simple_baseline import FlareLightningModule
-from downstream_apps.template.metrics.template_metrics import FlareMetrics
+from downstream_apps.solar_wind.configs import TrainingConfig, load_solar_wind_config
+from downstream_apps.solar_wind.datasets.solar_wind_dataset_01 import SolarWindDSDataset
+from downstream_apps.solar_wind.lightning_modules.pl_simple_baseline import SolarWindLightningModule
+from downstream_apps.solar_wind.metrics.template_metrics import SolarWindMetrics
 from workshop_infrastructure.assets import ensure_assets
 from workshop_infrastructure.datasets.builders import build_helio_dataloaders
 from workshop_infrastructure.utils import (
@@ -55,7 +55,7 @@ from workshop_infrastructure.utils import (
     UploadBestCheckpointToS3,
 )
 
-DEFAULT_CONFIG = Path(__file__).parent / "configs" / "config_script.yaml"
+DEFAULT_CONFIG = Path(__file__).parent / "configs" / "config_script_01.yaml"
 
 # --deterministic accepts the same three tokens as the YAML key. argparse hands back a
 # string, so the two boolean ones are mapped to real bools -- TrainingConfig validates
@@ -92,42 +92,33 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _flare_label_transform(intensity: "pd.Series") -> "pd.Series":
-    """Normalize flare peak intensity for the template task.
-
-    Converts raw GOES intensity to a z-score-like label:
-      1. Take log10 (intensity values span many orders of magnitude).
-      2. Shift so the minimum is 0.
-      3. Scale by 2 * std so most values fall in [-1, 1].
-    """
-    import numpy as np
-    log_intensity = np.log10(intensity)
-    shifted = log_intensity - log_intensity.min()
-    return shifted / (2 * shifted.std())
-
-
 def build_datasets(cfg: TrainingConfig, scalers) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders from config.
 
     Everything generic (channels, temporal sampling, S3 access, worker settings) is
-    handled by build_helio_dataloaders(). Only the flare-specific arguments below are
+    handled by build_helio_dataloaders(). Only the solar-wind-specific arguments below are
     this app's business — when you fork the template, this is the list you replace.
+
+    Solar wind carries two separate OMNI label indices (train/val), unlike the flare
+    template's single shared catalog, so ds_index_path is passed per-split via
+    train_kwargs/val_kwargs rather than as a shared task kwarg.
 
     ``scalers`` is built once in main() and shared with build_model(), so the two paths
     cannot end up with different normalization statistics.
     """
     return build_helio_dataloaders(
         cfg,
-        FlareDSDataset,
+        SolarWindDSDataset,
         scalers=scalers,
         seed=cfg.seed,
         return_surya_stack=True,
         max_number_of_samples=cfg.data.max_samples,
-        label_transform=_flare_label_transform,
-        ds_flare_index_path=cfg.data.flare_index_path,
         ds_time_column=cfg.data.ds_time_column,
+        ds_target_column=cfg.data.ds_target_column,
         ds_time_tolerance=cfg.data.ds_time_tolerance,
         ds_match_direction=cfg.data.ds_match_direction,
+        train_kwargs={"ds_index_path": cfg.data.ds_train_index_path},
+        val_kwargs={"ds_index_path": cfg.data.ds_val_index_path},
     )
 
 
@@ -138,24 +129,24 @@ def build_model(cfg: TrainingConfig, scalers, train_baseline: bool = False) -> L
     signum-log space; the HelioSpectformer path works directly on normalized inputs.
     """
     metrics = {
-        "train_loss": FlareMetrics("train_loss"),
+        "train_loss": SolarWindMetrics("train_loss"),
         # val_loss is what ModelCheckpoint monitors; val_metrics are reported only.
-        "val_loss": FlareMetrics("val_loss"),
-        "train_metrics": FlareMetrics("train_metrics"),
-        "val_metrics": FlareMetrics("val_metrics"),
+        "val_loss": SolarWindMetrics("val_loss"),
+        "train_metrics": SolarWindMetrics("train_metrics"),
+        "val_metrics": SolarWindMetrics("val_metrics"),
     }
 
     if train_baseline:
         from functools import partial
-        from downstream_apps.template.models.simple_baseline import (
-            RegressionFlareModel,
+        from downstream_apps.solar_wind.models.simple_baseline import (
+            RegressionSolarWindModel,
             destandardize_channels,
         )
         n_input_timestamps = cfg.model.time_embedding.time_dim
         n_channels = len(cfg.data.channels)
-        model = RegressionFlareModel(n_input_timestamps * n_channels)
+        model = RegressionSolarWindModel(n_input_timestamps * n_channels)
         preprocess_fn = partial(destandardize_channels, channel_order=cfg.data.channels, scalers=scalers)
-        return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size, preprocess_fn=preprocess_fn)
+        return SolarWindLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size, preprocess_fn=preprocess_fn)
     else:
         from workshop_infrastructure.models.finetune_models import HelioSpectformer1D
         model = HelioSpectformer1D.from_config(
@@ -179,7 +170,7 @@ def build_model(cfg: TrainingConfig, scalers, train_baseline: bool = False) -> L
 
         _log_trainable_parameters(model)
 
-    return FlareLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size)
+    return SolarWindLightningModule(model, metrics, lr=cfg.learning_rate, batch_size=cfg.batch_size)
 
 
 def _log_trainable_parameters(model) -> None:
@@ -252,7 +243,7 @@ def main() -> None:
     args = parse_args()
     torch.set_float32_matmul_precision("medium")
 
-    cfg = load_flare_config(args.config)
+    cfg = load_solar_wind_config(args.config)
     # Seeding comes after the config load, so the seed is a configured value rather than
     # a constant buried in the code. Seeds Python, NumPy and torch in this process;
     # workers=True extends it to DataLoader workers.

@@ -1,8 +1,5 @@
 """
-A simple linear regression model to be used as a baseline for solar-wind speed forecasting.
-
-The original flare-forecasting version of this file (``RegressionFlareModel``) is
-preserved in ``simple_baseline_flare_backup.py`` for reference.
+A simple linear regression model to be used as a baseline for flare forecasting.
 """
 
 import torch
@@ -38,10 +35,10 @@ def destandardize_channels(batch: dict, channel_order: list, scalers: dict) -> d
     return {**batch, "ts": x}
 
 
-class RegressionSolarWindModel(nn.Module):
+class RegressionFlareModel(nn.Module):
     def __init__(self, input_dim: int):
         """
-        Initializes the RegressionSolarWindModel.
+        Initializes the RegressionFlareModel.
 
         Args:
             input_dim (int): The size of the input vector after channel and time dimensions are flattened.
@@ -50,7 +47,7 @@ class RegressionSolarWindModel(nn.Module):
             This model expects 'ts' in the batch dict to already be in **signum-log** space
             (channel z-scores undone, log compression retained). Use
             destandardize_channels() to pre-process normalized SDO inputs before passing
-            them here (e.g., via the preprocess_fn argument of SolarWindLightningModule).
+            them here (e.g., via the preprocess_fn argument of FlareLightningModule).
         """
         super().__init__()
         self.linear = nn.Linear(input_dim, 1)
@@ -70,7 +67,7 @@ class RegressionSolarWindModel(nn.Module):
         """
         x = x["ts"]
 
-        # Collapse input stack spatially and take absolute value for strictly positive solar-wind speed
+        # Collapse input stack spatially and take absolute value for strictly positive flare fluxes
         x = x.abs().mean(dim=[3, 4])
 
         # Rearrange in preparation for linear layer

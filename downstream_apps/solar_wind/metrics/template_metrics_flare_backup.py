@@ -1,17 +1,14 @@
 """
-Template metrics for solar-wind speed regression.
+Template metrics for flare forecasting.
 
-The original flare-forecasting version of this file (``FlareMetrics``) is preserved in
-``template_metrics_flare_backup.py`` for reference.
-
-SolarWindMetrics defines four metric sets:
+FlareMetrics defines four metric sets:
 - "train_loss"    — differentiable loss that drives backpropagation (MSE).
 - "val_loss"      — the quantity logged as `val_loss` and used to select checkpoints.
                     Defaults to the same MSE as "train_loss"; override it when your task
                     needs a different validation objective.
-- "train_metrics" — non-differentiable metrics logged during training (RRSE, RMSE).
-- "val_metrics"   — metrics logged at validation for reporting only (MSE + RRSE + RMSE).
-                    These do NOT influence checkpoint selection — "val_loss" does.
+- "train_metrics" — non-differentiable metrics logged during training (RRSE).
+- "val_metrics"   — metrics logged at validation for reporting only (MSE + RRSE). These
+                    do NOT influence checkpoint selection — "val_loss" does.
 
 The __call__ method selects the appropriate metric set based on the mode passed at
 construction time. The dictionary keys returned by each method become the metric names
@@ -25,10 +22,10 @@ import torchmetrics as tm  # Lots of possible metrics in here https://lightning.
 # linear baseline, while targets are always (B, 1). Every metric below flattens both with
 # reshape(-1) rather than squeeze(-1): squeeze is shape-dependent and collapses a
 # batch of one to a 0-d scalar, which then fails to broadcast against a (1,) target.
-class SolarWindMetrics:
+class FlareMetrics:
     def __init__(self, mode: str):
         """
-        Initialize SolarWindMetrics class.
+        Initialize FlareMetrics class.
 
         Args:
             mode (str): Mode to use for metric evaluation. One of "train_loss",
@@ -38,14 +35,11 @@ class SolarWindMetrics:
 
         # Cache torchmetrics instances once (instead of recreating each call)
         self._rrse = tm.RelativeSquaredError(squared=False)
-        self._rmse = tm.MeanSquaredError(squared=False)
 
     def _ensure_device(self, preds: torch.Tensor) -> None:
         """Move torchmetrics modules to the same device as ``preds``, if needed."""
         if self._rrse.device != preds.device:
             self._rrse = self._rrse.to(preds.device)
-        if self._rmse.device != preds.device:
-            self._rmse = self._rmse.to(preds.device)
 
     def train_loss(
         self, preds: torch.Tensor, target: torch.Tensor
@@ -123,10 +117,8 @@ class SolarWindMetrics:
 
         self._ensure_device(preds)
         output_metrics["rrse"] = self._rrse(preds.reshape(-1), target.reshape(-1))
-        output_weights.append(1)
+        output_weights.append(1)        
 
-        output_metrics["rmse"] = self._rmse(preds.reshape(-1), target.reshape(-1))
-        output_weights.append(1)
 
         return output_metrics, output_weights
 
@@ -156,10 +148,7 @@ class SolarWindMetrics:
 
         self._ensure_device(preds)
         output_metrics["rrse"] = self._rrse(preds.reshape(-1), target.reshape(-1))
-        output_weights.append(1)
-
-        output_metrics["rmse"] = self._rmse(preds.reshape(-1), target.reshape(-1))
-        output_weights.append(1)
+        output_weights.append(1)            
 
         return output_metrics, output_weights
 
@@ -176,7 +165,7 @@ class SolarWindMetrics:
             tuple[dict[str, torch.Tensor], list[float]]:
                 - Metric dictionary. Keys become logger metric names; values are
                   scalar tensors aggregated over the batch.
-                - List of per-metric weights (used by SolarWindLightningModule to
+                - List of per-metric weights (used by FlareLightningModule to
                   combine multiple loss terms into a single scalar).
         """
 
