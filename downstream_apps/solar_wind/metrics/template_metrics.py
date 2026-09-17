@@ -9,13 +9,32 @@ SolarWindMetrics defines four metric sets:
 - "val_loss"      — the quantity logged as `val_loss` and used to select checkpoints.
                     Defaults to the same MSE as "train_loss"; override it when your task
                     needs a different validation objective.
-- "train_metrics" — non-differentiable metrics logged during training (RRSE, RMSE).
-- "val_metrics"   — metrics logged at validation for reporting only (MSE + RRSE + RMSE).
+- "train_metrics" — non-differentiable metrics logged during training.
+- "val_metrics"   — metrics logged at validation for reporting only.
                     These do NOT influence checkpoint selection — "val_loss" does.
 
 The __call__ method selects the appropriate metric set based on the mode passed at
 construction time. The dictionary keys returned by each method become the metric names
 propagated to the logger (e.g. WandB, CSV).
+
+PER-BATCH vs PER-EPOCH — why RMSE is not logged per batch
+---------------------------------------------------------
+``__call__`` returns per-*batch* values, and Lightning averages whatever it is handed over
+the epoch. Averaging is only faithful for quantities that are linear in the batch, which
+MSE is (with ``drop_last=True`` every batch is the same size, so the mean of per-batch MSE
+is the exact global MSE) and RMSE is not. Logging a per-batch RMSE therefore reports the
+mean of per-batch square roots, which understates the true global RMSE — it read 49.55
+where the real figure was 59.72.
+
+Worse, a *relative* metric is meaningless per batch: ``RelativeSquaredError`` normalizes by
+the variance of the targets it is given, and at ``batch_size=2`` that is the variance of
+two numbers, so it divides by ~0 and explodes (values of 17-227 were logged). RRSE has been
+removed for that reason.
+
+So: ``__call__`` reports only MSE, and RMSE / MAE / Pearson r are accumulated across the
+epoch and emitted once by ``compute()``. ``SolarWindLightningModule`` drives that through
+``update()`` / ``compute()`` / ``reset()``; a metrics object without those methods still
+works exactly as before, so this stays compatible with plain callables.
 """
 
 import torch
@@ -36,16 +55,60 @@ class SolarWindMetrics:
         """
         self.mode = mode
 
-        # Cache torchmetrics instances once (instead of recreating each call)
-        self._rrse = tm.RelativeSquaredError(squared=False)
-        self._rmse = tm.MeanSquaredError(squared=False)
+        # Accumulating torchmetrics instances, built once and reused. These hold state
+        # across the epoch: update() feeds them, compute() reads the epoch-level value, and
+        # reset() clears them at the epoch boundary. Pearson r is included because it is the
+        # conventional skill measure for solar wind speed and is only defined over a
+        # population, never over a single batch of two.
+        self._epoch_metrics: dict[str, tm.Metric] = {
+            "mse": tm.MeanSquaredError(squared=True),
+            "rmse": tm.MeanSquaredError(squared=False),
+            "mae": tm.MeanAbsoluteError(),
+            "r": tm.PearsonCorrCoef(),
+        }
 
     def _ensure_device(self, preds: torch.Tensor) -> None:
-        """Move torchmetrics modules to the same device as ``preds``, if needed."""
-        if self._rrse.device != preds.device:
-            self._rrse = self._rrse.to(preds.device)
-        if self._rmse.device != preds.device:
-            self._rmse = self._rmse.to(preds.device)
+        """Move the accumulating torchmetrics modules to ``preds``' device, if needed."""
+        for name, metric in self._epoch_metrics.items():
+            if metric.device != preds.device:
+                self._epoch_metrics[name] = metric.to(preds.device)
+
+    # ------------------------------------------------------------------
+    # Epoch-level accumulation
+    # ------------------------------------------------------------------
+
+    def update(self, preds: torch.Tensor, target: torch.Tensor) -> None:
+        """Accumulate one batch into the epoch-level metrics.
+
+        Called once per batch by ``SolarWindLightningModule``. Nothing is logged here; the
+        accumulated values are read by ``compute()`` at the end of the epoch.
+        """
+        self._ensure_device(preds)
+        flat_preds, flat_target = preds.reshape(-1), target.reshape(-1)
+        for metric in self._epoch_metrics.values():
+            metric.update(flat_preds, flat_target)
+
+    def compute(self) -> dict[str, torch.Tensor]:
+        """Return the epoch-level metrics accumulated since the last ``reset()``.
+
+        Metrics that cannot be computed from what was accumulated are dropped rather than
+        raising: ``PearsonCorrCoef`` needs at least two samples and a non-zero variance in
+        both series, which a one-batch sanity run does not always provide.
+        """
+        results = {}
+        for name, metric in self._epoch_metrics.items():
+            try:
+                value = metric.compute()
+            except (ValueError, RuntimeError):
+                continue
+            if torch.isfinite(value).all():
+                results[name] = value
+        return results
+
+    def reset(self) -> None:
+        """Clear the accumulated state. Call at the start of every epoch."""
+        for metric in self._epoch_metrics.values():
+            metric.reset()
 
     def train_loss(
         self, preds: torch.Tensor, target: torch.Tensor
@@ -103,10 +166,14 @@ class SolarWindMetrics:
         self, preds: torch.Tensor, target: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], list[float]]:
         """
-        Calculate evaluation metrics for training.
+        Calculate per-batch evaluation metrics for training.
         IMPORTANT:  These metrics are only for reporting purposes and do not
                     contribute to the training loss. Use only if you want to
                     monitor additional metrics during training.
+
+        Only MSE is returned, because it is the one quantity here that survives Lightning
+        averaging it over the epoch. RMSE, MAE and Pearson r come from ``compute()`` at the
+        epoch boundary instead — see the PER-BATCH vs PER-EPOCH note in the module docstring.
 
         Args:
             preds (torch.Tensor): Model predictions.
@@ -121,11 +188,7 @@ class SolarWindMetrics:
         output_metrics = {}
         output_weights = []
 
-        self._ensure_device(preds)
-        output_metrics["rrse"] = self._rrse(preds.reshape(-1), target.reshape(-1))
-        output_weights.append(1)
-
-        output_metrics["rmse"] = self._rmse(preds.reshape(-1), target.reshape(-1))
+        output_metrics["mse"] = torch.nn.functional.mse_loss(preds.reshape(-1), target.reshape(-1))
         output_weights.append(1)
 
         return output_metrics, output_weights
@@ -134,7 +197,10 @@ class SolarWindMetrics:
         self, preds: torch.Tensor, target: torch.Tensor
     ) -> tuple[dict[str, torch.Tensor], list[float]]:
         """
-        Calculate metrics for validation.
+        Calculate per-batch metrics for validation.
+
+        As with ``train_metrics``, only MSE is reported per batch; the epoch-level RMSE, MAE
+        and Pearson r are emitted by ``compute()``.
 
         Args:
             preds (torch.Tensor): Model predictions.
@@ -152,13 +218,6 @@ class SolarWindMetrics:
         output_weights = []
 
         output_metrics["mse"] = torch.nn.functional.mse_loss(preds.reshape(-1), target.reshape(-1))
-        output_weights.append(1)
-
-        self._ensure_device(preds)
-        output_metrics["rrse"] = self._rrse(preds.reshape(-1), target.reshape(-1))
-        output_weights.append(1)
-
-        output_metrics["rmse"] = self._rmse(preds.reshape(-1), target.reshape(-1))
         output_weights.append(1)
 
         return output_metrics, output_weights

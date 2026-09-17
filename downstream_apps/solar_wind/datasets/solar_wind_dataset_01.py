@@ -18,6 +18,11 @@ class SolarWindDSDataset(HelioNetCDFDataset):
         return_surya_stack: If True (default), include the Surya image stack in the returned dict.
             Set to False to return only the solar-wind label (useful for label inspection).
         max_number_of_samples: Cap the dataset length at this value. Useful for quick experiments.
+        train_subsample_seed: If ``max_number_of_samples`` caps the dataset, draw a random
+            subset seeded by this value instead of taking the chronological prefix. Leave
+            ``None`` for a data-amount sweep (each larger cap is then a superset of smaller
+            ones); set a distinct value per run to build ensemble members from diverse
+            training subsets of the same pool while validation stays identical.
         label_transform: Optional callable applied to the ``ds_target_column`` column of the
             index to produce the ``normalized_target`` label. Signature:
             ``(series: pd.Series) -> pd.Series``.  If ``None``, the raw values are used as-is.
@@ -46,6 +51,7 @@ class SolarWindDSDataset(HelioNetCDFDataset):
         # Downstream-specific parameters
         return_surya_stack: bool = True,
         max_number_of_samples: int | None = None,
+        train_subsample_seed: int | None = None,
         label_transform: Callable[[pd.Series], pd.Series] | None = None,
         ds_index_path: str | None = None,
         ds_time_column: str | None = None,
@@ -141,8 +147,19 @@ class SolarWindDSDataset(HelioNetCDFDataset):
         self.df_valid_indices.set_index("valid_indices", inplace=True)
 
         if max_number_of_samples is not None and max_number_of_samples < self.adjusted_length:
-            self.valid_indices = self.valid_indices[:max_number_of_samples]
-            self.df_valid_indices = self.df_valid_indices.iloc[:max_number_of_samples]
+            if train_subsample_seed is not None:
+                # Random subset (sorted back into time order) rather than a chronological
+                # prefix, so different seeds over the same pool give different but
+                # comparably-sized training sets — what an ensemble's members need.
+                rng = np.random.default_rng(train_subsample_seed)
+                positions = np.sort(
+                    rng.choice(self.adjusted_length, size=max_number_of_samples, replace=False)
+                )
+                self.valid_indices = [self.valid_indices[i] for i in positions]
+                self.df_valid_indices = self.df_valid_indices.iloc[positions]
+            else:
+                self.valid_indices = self.valid_indices[:max_number_of_samples]
+                self.df_valid_indices = self.df_valid_indices.iloc[:max_number_of_samples]
             self.adjusted_length = max_number_of_samples
 
     def __len__(self):

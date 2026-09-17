@@ -1,0 +1,100 @@
+# =============================================================================
+# Temporal holdout check: same trained checkpoint (seed=101), evaluated against a
+# DIFFERENT time period than the one it was validated against during training.
+#
+# Identical to config_calibration.yaml in every field that determines model
+# architecture (model:, training:) so 4_ensemble_eval.py can rebuild the exact same
+# HelioSpectformer1D + LoRA structure and load the checkpoint's weights. The only
+# change is ds_val_index_path, which now points at validation_holdout_late.csv — the
+# last 300 rows of validation.csv (2019-01-19 to 2019-01-31), instead of the original
+# validation.csv (whose matched chronological prefix starts near 2011-01-15). No
+# retraining involved: this is inference-only, on data never scored against before.
+# =============================================================================
+
+job_id: solar_wind_speed_forecasting_calib
+
+data:
+  train_data_path: ../../../data/indices/surya_aws_s3_train.csv
+  valid_data_path: ../../../data/indices/surya_aws_s3_val.csv
+  scalers_path: ../assets/scalers.yaml
+
+  channels: [aia94, aia131, aia171, aia193, aia211, aia304, aia335, aia1600,
+             hmi_m, hmi_bx, hmi_by, hmi_bz, hmi_v]
+  time_delta_input_minutes: [0]
+  time_delta_target_minutes: 60
+
+  ds_train_index_path: ../data/hf_solar_wind/train.csv
+  # Temporal holdout: a different time period than every other run in this session.
+  ds_val_index_path: ../data/hf_solar_wind/validation_holdout_late.csv
+  ds_time_column: timestamp
+  ds_target_column: V
+  ds_time_tolerance: 6min
+  ds_match_direction: nearest
+
+  s3_anon: true
+  s3_mode: download
+  s3_cache_dir: /home/jovyan/scratch_space/surya_cache
+  s3_boto3_max_concurrency: 4
+  s3_boto3_part_size_mb: 64
+
+  max_samples: 150
+  max_val_samples: 100
+  train_subsample_seed: 101
+
+model:
+  pretrained_path: ../assets/surya.366m.v1.pt
+  img_size: 4096
+  patch_size: 16
+  in_channels: 13
+  embed_dim: 1280
+  depth: 10
+  spectral_blocks: 2
+  num_heads: 16
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  window_size: 2
+  dp_rank: 4
+  rpe: false
+  learned_flow: false
+  init_weights: false
+  checkpoint_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  ensemble: null
+  time_embedding:
+    type: linear
+    n_queries: null
+    time_dim: 1
+
+  pooling: class_token
+  penultimate_linear_layer: true
+  dropout: 0.2
+  freeze_backbone: false
+
+  use_lora: true
+  lora_config:
+    r: 8
+    lora_alpha: 8
+    lora_dropout: 0.1
+    bias: none
+    target_modules: [fc1, fc2, attn.qkv, attn.proj]
+
+training:
+  learning_rate: 0.0001
+  batch_size: 2
+  max_epochs: 20
+  num_workers: 2
+  seed: 42
+  deterministic: false
+  rollout_steps: 0
+  drop_hmi_probability: 0.0
+  use_latitude_in_learned_flow: false
+  dtype: float32
+
+output:
+  ckpt_dir: checkpoints
+  s3_bucket: null
+  s3_prefix: ""
+  s3_best_key: best.ckpt
+
+logging:
+  wandb_project: solar_wind_regression
+  wandb_entity: null

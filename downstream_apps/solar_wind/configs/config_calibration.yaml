@@ -25,7 +25,7 @@
 #   --deterministic warn   (reproducible run; see training.deterministic below)
 # =============================================================================
 
-job_id: solar_wind_speed_forecasting
+job_id: solar_wind_speed_forecasting_calib
 
 
 # -----------------------------------------------------------------------------
@@ -116,7 +116,7 @@ data:
   # stays fixed across every run below). Each downstream sample fetches a matched SDO
   # frame from S3 (~1 GB, ~9s from a warm cache) — with a 10 GPU-hour budget, keep this in
   # the low hundreds, not thousands; null (all ~70k matched rows) is not affordable.
-  max_samples: null
+  max_samples: 150
 
   # Caps VALIDATION to a fixed size (chronological prefix, same every run — the val index
   # is ~2.5k matched samples uncapped, unaffordable to score every epoch on a small GPU
@@ -129,7 +129,25 @@ data:
   # int per run to draw a random subset instead, for ensemble members trained on diverse
   # subsets of the same pool while validation stays identical.
   #
-  # --- RUNBOOK: three comparisons this app's naming/decoupling changes are built for ---
+  # ###################################################################################
+  # DO NOT FOLLOW THE RUNBOOK BELOW. It is kept only to document what the first eight
+  # runs did; every one of them is uninterpretable. Use configs/config_experiment.yaml.
+  #
+  # The specific trap is the "nested prefix" advice: with train_subsample_seed null the
+  # dataset takes a CHRONOLOGICAL PREFIX, so max_samples: 250 means 250 *consecutive
+  # hours*. Solar wind speed decorrelates with an e-folding time of ~1.8 days
+  # (r(24h)=0.719, r(48h)=0.418, r(72h)=0.203, r(96h)=0.082), so those runs held 3-8
+  # effectively independent samples, not 50-250:
+  #
+  #     n=50  -> 4.7 d span, V std 27.3 km/s, n_eff ~3
+  #     n=250 -> 14.2 d span, V std 55.6 km/s, n_eff ~8   (population std is 93.9)
+  #
+  # Sweeping max_samples this way varies n without meaningfully varying n_eff, so it
+  # cannot measure the effect of training-data amount. The same applies to the
+  # validation set: max_val_samples: 100 here is 100 consecutive hours with a std of
+  # 32.4 km/s, which a constant predictor beats. See EXPERIMENTS.md.
+  # ###################################################################################
+  # --- RUNBOOK (SUPERSEDED — see the warning above) ---
   #   Category 3 — baseline vs. LoRA finetune, identical train/val (leave both fields as-is):
   #     python -m downstream_apps.solar_wind.3_finetune_template_1D --train_baseline --max-epochs 8
   #     python -m downstream_apps.solar_wind.3_finetune_template_1D --max-epochs 8
@@ -140,7 +158,7 @@ data:
   #     max_samples: 150, train_subsample_seed: 101 / 102 / 103
   #   Every run prints its auto-generated name ("[RUN] ...") and logs under it in WandB and
   #   runs/<run_name>/ — no need to hand-edit job_id to tell runs apart.
-  train_subsample_seed: null
+  train_subsample_seed: 101
 
 
 # -----------------------------------------------------------------------------
@@ -202,7 +220,7 @@ training:
   learning_rate: 0.0001
   batch_size: 2         # Per-device batch size under DDP
   max_epochs: 20        # Can be overridden with --max-epochs at the CLI
-  num_workers: 8        # DataLoader worker processes per device (use 0 to debug in-process)
+  num_workers: 2        # DataLoader worker processes per device (use 0 to debug in-process)
 
   # -- Reproducibility --
   # Seeds Python, NumPy, torch, every DataLoader worker, and the shuffle order. Two runs

@@ -93,6 +93,15 @@ class SolarWindLightningModule(L.LightningModule):
           - val_metrics logged during validation_step (if weights is non-empty).
             Reported only; they do not influence checkpoint selection.
 
+        Optional accumulation protocol:
+          A metrics object may additionally implement ``update(preds, target)``,
+          ``compute() -> dict[str, Tensor]`` and ``reset()``. When it does, this module
+          feeds it every batch, resets it at each epoch start, and logs ``compute()`` at each
+          epoch end under the ``train_epoch_``/``val_epoch_`` prefixes. This is how metrics
+          that are not linear in the batch (RMSE, MAE, Pearson r) get correct epoch-level
+          values instead of an average of per-batch values. A plain callable without those
+          methods is skipped, so the protocol is optional.
+
     lr:
         Learning rate for the Adam optimizer.
 
@@ -207,11 +216,14 @@ class SolarWindLightningModule(L.LightningModule):
         for key in training_losses.keys():
             self.log(f"train_loss_{key}", training_losses[key], prog_bar=False, batch_size=self.batch_size, sync_dist=True)
 
-        # Log evaluation metrics (optional).
+        # Log per-batch evaluation metrics (optional).
         training_evaluation_metrics, training_evaluation_weights = self.training_evaluation(output, target)
         if len(training_evaluation_weights) > 0:
             for key in training_evaluation_metrics.keys():
                 self.log(f"train_metric_{key}", training_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size, sync_dist=True)
+
+        # Feed the epoch-level accumulators, for metrics that cannot be averaged per batch.
+        self._update_epoch_metrics(self.training_evaluation, output, target)
 
         return loss
 
@@ -252,19 +264,78 @@ class SolarWindLightningModule(L.LightningModule):
         for key in val_losses.keys():
             self.log(f"val_loss_{key}", val_losses[key], prog_bar=False, batch_size=self.batch_size, sync_dist=True)
 
-        # Log evaluation metrics (optional).
+        # Log per-batch evaluation metrics (optional).
         val_evaluation_metrics, val_evaluation_weights = self.validation_evaluation(output, target)
         if len(val_evaluation_weights) > 0:
             for key in val_evaluation_metrics.keys():
                 self.log(f"val_metric_{key}", val_evaluation_metrics[key], prog_bar=False, batch_size=self.batch_size, sync_dist=True)
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
+        # Feed the epoch-level accumulators, for metrics that cannot be averaged per batch.
+        self._update_epoch_metrics(self.validation_evaluation, output, target)
+
+    # ------------------------------------------------------------------
+    # Epoch-level metrics
+    #
+    # RMSE, MAE and Pearson r are not linear in the batch, so averaging per-batch values
+    # over an epoch does not give the epoch's value (and at batch_size=2 a correlation is
+    # not even defined). Metric objects that expose update()/compute()/reset() therefore
+    # accumulate across the epoch and are read once at the end. Objects that do not expose
+    # them — a plain callable, as the metrics contract allows — are skipped, so this is
+    # backwards compatible.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _supports_accumulation(evaluator: Any) -> bool:
+        """True if ``evaluator`` implements the update/compute/reset accumulation protocol."""
+        return all(callable(getattr(evaluator, name, None)) for name in ("update", "compute", "reset"))
+
+    def _update_epoch_metrics(
+        self, evaluator: Any, output: torch.Tensor, target: torch.Tensor
+    ) -> None:
+        if self._supports_accumulation(evaluator):
+            evaluator.update(output.detach(), target.detach())
+
+    def _log_epoch_metrics(self, evaluator: Any, prefix: str) -> None:
+        if not self._supports_accumulation(evaluator):
+            return
+        for key, value in evaluator.compute().items():
+            # sync_dist is not needed: torchmetrics already reduces its own state across
+            # ranks inside compute(), and syncing an already-reduced scalar would average it
+            # a second time.
+            self.log(f"{prefix}_{key}", value, prog_bar=False, batch_size=self.batch_size)
+
+    def on_train_epoch_start(self) -> None:
+        if self._supports_accumulation(self.training_evaluation):
+            self.training_evaluation.reset()
+
+    def on_train_epoch_end(self) -> None:
+        self._log_epoch_metrics(self.training_evaluation, "train_epoch")
+
+    def on_validation_epoch_start(self) -> None:
+        if self._supports_accumulation(self.validation_evaluation):
+            self.validation_evaluation.reset()
+
+    def on_validation_epoch_end(self) -> None:
+        self._log_epoch_metrics(self.validation_evaluation, "val_epoch")
+
+    def configure_optimizers(self) -> Dict[str, Any]:
         """
-        Configure the optimizer used by Lightning.
+        Configure the optimizer and LR schedule used by Lightning.
+
+        Adam alone, with a fixed ``self.lr`` for the whole run, was found to overshoot:
+        the LoRA adapters start as a no-op and the head_* modules start randomly
+        initialized, so early steps make large, useful corrections — but nothing tells
+        Adam to slow down once it finds a good region, so later epochs bounce to a worse
+        val_loss before partially recovering. Cosine-decaying the LR to ~0 over the run
+        lets it settle into that region instead of overshooting past it.
 
         Returns
         -------
-        torch.optim.Optimizer
-            Adam optimizer over all module parameters with learning rate `self.lr`.
+        dict
+            Adam optimizer plus a per-epoch CosineAnnealingLR schedule.
         """
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=self.trainer.max_epochs
+        )
+        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}

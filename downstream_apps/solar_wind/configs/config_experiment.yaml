@@ -1,0 +1,262 @@
+# =============================================================================
+# Solar wind speed (V) regression — the designed experiment.
+#
+# This config replaces config_calibration.yaml, which is kept unchanged as the record of
+# the first eight runs. Those runs cannot support a conclusion; see EXPERIMENTS.md. The
+# four changes that matter are called out inline below and summarized here:
+#
+#   1. Designed splits (ds_*_index_path). The old runs trained on a chronological PREFIX,
+#      so "n=250" meant 250 consecutive hours. V decorrelates with an e-folding time of
+#      ~1.8 days (r(24h)=0.719, r(48h)=0.418, r(72h)=0.203, r(96h)=0.082), so those runs
+#      held 3-8 effectively independent samples over windows showing a third of the
+#      population's variance. The designed splits space samples out instead.
+#   2. Target standardization (target_mean/target_std). Previously absent, so every model
+#      spent its budget walking a ~418 km/s offset.
+#   3. pooling: class_token, so head_linear is applied to one token per sample rather than to
+#      all 65,536 patch tokens (global_average). Mainly an activation-memory choice.
+#   4. deterministic: false. Required, not preferred: "warn" disables memory-efficient
+#      attention and the LoRA backward pass then OOMs on a 44 GiB GPU. The cost is that runs
+#      are not bit-reproducible, so only LARGE differences between runs are interpretable.
+#
+# RUNBOOK — build the cache once, then everything else is cheap
+# -------------------------------------------------------------
+# Wall-clock here is ~100% I/O (the 14-parameter baseline and the 366M LoRA model both ran at
+# 4.8 s per sample-pass), so the order below is not a style preference: it is the difference
+# between minutes and hours. Raise s3_boto3_max_concurrency for the cache pass — 4 -> 16 took
+# the sustained cold-fetch rate from ~68 s to ~9 s per batch.
+#
+# 1. Cache the frozen backbone's embeddings once (Tier 1 + Tier 2). --verify checks that the
+#    cache reproduces a full forward pass before anything is built on it.
+#      python -m downstream_apps.solar_wind.6_cache_embeddings \
+#        --config downstream_apps/solar_wind/configs/config_experiment.yaml \
+#        --num-workers 8 --s3-concurrency 16 --verify
+#
+# 2. Cache Tier 3 (temporal holdout) from the same config.
+#      python -m downstream_apps.solar_wind.6_cache_embeddings \
+#        --config downstream_apps/solar_wind/configs/config_experiment.yaml --only val \
+#        --num-workers 8 --s3-concurrency 16 \
+#        --val-index downstream_apps/solar_wind/data/hf_solar_wind/holdout_late_designed.csv \
+#        --name holdout_late
+#
+# 3. Run the controls, the pre-specified primary test, and the three comparison categories.
+#    Seconds, not hours, because it reads 5 KB per sample instead of 1 GB.
+#      python -m downstream_apps.solar_wind.7_probe_from_cache
+#
+#    A frozen-backbone head is an affine map from the pooled 1280-d embedding to a scalar, and
+#    the ridge probe fits the optimal one — so if step 3 finds no skill, no amount of head
+#    training on this backbone will either, and step 4 is only worth running for LoRA.
+#
+# 4. Confirm on the real training path. LoRA changes the backbone, so it cannot use the cache
+#    and this is the one step that costs real GPU time.
+#      python -m downstream_apps.solar_wind.3_finetune_template_1D \
+#        --config downstream_apps/solar_wind/configs/config_experiment.yaml --train_baseline
+#      python -m downstream_apps.solar_wind.3_finetune_template_1D \
+#        --config downstream_apps/solar_wind/configs/config_experiment.yaml
+# =============================================================================
+
+job_id: solar_wind_v_regression
+
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+data:
+  train_data_path: ../../../data/indices/surya_aws_s3_train.csv
+  valid_data_path: ../../../data/indices/surya_aws_s3_val.csv
+  scalers_path: ../assets/scalers.yaml
+
+  channels: [aia94, aia131, aia171, aia193, aia211, aia304, aia335, aia1600,
+             hmi_m, hmi_bx, hmi_by, hmi_bz, hmi_v]
+  time_delta_input_minutes: [0]
+  time_delta_target_minutes: 60
+
+  # -- Designed splits (three tiers) --
+  # Built from the HF benchmark CSVs by row selection only (pandas, no code), so the
+  # sampling design is auditable in the files themselves rather than buried in dataset
+  # slicing logic. Sample spacing is chosen against V's ~1.8-day decorrelation time so that
+  # n_eff ~= n instead of n_eff ~= 3-8.
+  #
+  # Tiers 2 and 3 are selected by matching FIRST and thinning second: pre-thinning and then
+  # matching cost 40% of the samples, because only 74% of validation.csv rows have a Surya
+  # frame within 6 min and the survivors are not evenly spread. Counts below are after
+  # matching, so they are what the loaders actually see.
+  #
+  #   TIER 1  train_designed.csv        250 samples, >=9.7 d spacing, 2010-05..2019-12,
+  #                                     V = 418.2 +/- 93.6 km/s — i.e. the full population
+  #                                     spread (93.9). All model selection and the lag sweep
+  #                                     happen here, via blocked CV with an embargo, giving
+  #                                     250 mutually independent out-of-fold predictions.
+  #   TIER 2  validation_designed.csv    32 samples, >=4.0 d spacing, 2011-01..2019-01,
+  #                                     V = 396.2 +/- 70.3 km/s. Independent (r(96h)=0.082)
+  #                                     and held out from every selection decision. Only 32
+  #                                     because validation.csv is 9 contiguous blocks
+  #                                     totalling 143 days — that is the hard ceiling on
+  #                                     independent samples in the official val split, and
+  #                                     the reason Tier 1 carries the primary analysis.
+  #   TIER 3  holdout_late_designed.csv  12 samples, Jan 2019, >=1 d spacing. Too few to
+  #                                     conclude from; qualitative temporal check only.
+  ds_train_index_path: ../data/hf_solar_wind/train_designed.csv
+  ds_val_index_path: ../data/hf_solar_wind/validation_designed.csv
+
+  ds_time_column: timestamp
+  ds_target_column: V
+  ds_time_tolerance: 6min          # Half the 12-min Surya cadence: the closest possible frame
+  ds_match_direction: nearest      # timestamp is already a point estimate, not an event start
+
+  # -- Target standardization --
+  # From train.csv in full (69,957 rows: mean 418.6, std 93.9 km/s), NOT from the 301-row
+  # designed subset (415.2 / 92.1). The two agree to ~1%, and pinning them to the full
+  # training split keeps reported units stable if the designed subset is ever regenerated —
+  # otherwise every past number would silently change scale.
+  #
+  # Report physical units as: RMSE_kms = sqrt(val_loss) * 93.9
+  #
+  # Reference lines — what "no skill" looks like. val_loss is in z units; the km/s figure is
+  # sqrt(val_loss)*93.9. Any run not clearly below these has learned nothing:
+  #
+  #                                  n    climatology (418.6)   oracle constant
+  #   TIER 1 train_designed         250      92.0 km/s              92.0 km/s
+  #   TIER 2 validation_designed     32      73.8 km/s              70.3 km/s
+  #   TIER 3 holdout_late_designed   12     104.2 km/s             103.8 km/s
+  #
+  # Note how close the two columns are on every tier — that is the point of the designed
+  # splits. On the OLD val set (100 consecutive hours) they were 59.2 and 32.4 km/s, a 27
+  # km/s gap that a model could appear to exploit just by drifting its output bias, with no
+  # skill whatsoever. Here there is no such gap left to exploit.
+  target_mean: 418.6
+  target_std: 93.9
+
+  # -- S3 --
+  s3_anon: true
+  s3_mode: download
+  s3_cache_dir: /home/jovyan/scratch_space/surya_cache
+  s3_boto3_max_concurrency: 16
+  s3_boto3_part_size_mb: 64
+
+  # -- Sample caps: deliberately disabled --
+  # The designed CSVs above ARE the sample selection, so capping here would re-truncate them
+  # to a chronological prefix and reintroduce exactly the defect being fixed. Leave all
+  # three null.
+  max_samples: null
+  max_val_samples: null
+  train_subsample_seed: null
+
+
+# -----------------------------------------------------------------------------
+# Model
+# -----------------------------------------------------------------------------
+model:
+  pretrained_path: ../assets/surya.366m.v1.pt
+
+  # -- Backbone (Surya 366M defaults — match the pretrained checkpoint) --
+  img_size: 4096
+  patch_size: 16
+  in_channels: 13
+  embed_dim: 1280
+  depth: 10
+  spectral_blocks: 2
+  num_heads: 16
+  mlp_ratio: 4.0
+  drop_rate: 0.0
+  window_size: 2
+  dp_rank: 4
+  rpe: false
+  learned_flow: false
+  init_weights: false
+  checkpoint_layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  ensemble: null
+  time_embedding:
+    type: linear
+    n_queries: null
+    time_dim: 1
+
+  # -- Fine-tuning head --
+  # global_average, not class_token, and this is load-bearing rather than a preference.
+  # Under class_token the CLS token is a *trainable input* to the backbone
+  # (forward_with_cls_token), so the backbone's output depends on head weights and cannot be
+  # cached. Under global_average (nglo=0) the backbone emits patch tokens, and because
+  # head_linear is linear and the pooling is a mean,
+  #     mean(head_linear(t)) == head_linear(mean(t))
+  # so caching mean(t) is mathematically exact. That is what lets 6_cache_embeddings.py
+  # replace a 1 GB/sample re-read with a 5 KB/sample one.
+  # class_token. Under it, forward_with_cls_token returns tokens[:, [0], :] — one token per
+  # sample — so head_linear (1280x1280) is applied once. Under global_average (nglo=0) the
+  # backbone returns all 65,536 patch tokens and head_linear runs on every one, which costs
+  # far more activation memory. That is a real cost, but note it was NOT what caused the LoRA
+  # OOM here: class_token OOMed too (verified via the trainable-parameter count, 3,157,761),
+  # and the actual culprit was training.deterministic — see that key below.
+  #
+  # The tradeoff: global_average is what makes backbone embeddings cacheable
+  # (mean(head_linear(t)) == head_linear(mean(t)) only holds when pooling is a mean, and the
+  # class token is a *trainable input* to the backbone so it cannot be cached at all). If you
+  # want to use 6_cache_embeddings.py, do it from a separate config that sets global_average
+  # and either penultimate_linear_layer: false or batch_size: 1 to stay inside memory.
+  pooling: class_token
+  penultimate_linear_layer: true
+  dropout: 0.2
+  freeze_backbone: false
+
+  use_lora: true
+  lora_config:
+    r: 8
+    lora_alpha: 8
+    lora_dropout: 0.1
+    bias: none
+    target_modules: [fc1, fc2, attn.qkv, attn.proj]
+
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+training:
+  learning_rate: 0.0001
+  batch_size: 2
+  max_epochs: 4
+
+  # Wall-clock here is ~100% I/O: the 14-parameter linear baseline and the 366M-parameter
+  # LoRA model both ran at 4.8 s per sample-pass. Workers are therefore the one setting that
+  # actually buys throughput. Raised from 2, but each worker holds a 13x4096x4096 float32
+  # stack (~873 MB) and prefetches 2, so this trades RAM for speed — do not raise it far
+  # without watching memory.
+  num_workers: 4
+
+  seed: 42
+
+  # MUST be false for LoRA on this GPU, and this is not a throughput choice.
+  #
+  # "warn" calls torch.use_deterministic_algorithms(warn_only=True), which disables the
+  # memory-efficient attention kernels. With 4096x4096 inputs at patch_size 16 that is 65,536
+  # tokens per sample, and the LoRA backward pass then tried to allocate 5 GiB with 43.9 of the
+  # GPU's 44.4 GiB already held — a hard OOM at batch_size=2. Verified by experiment: the same
+  # run with --deterministic false completes the backward pass fine. All eight earlier LoRA
+  # runs also used false.
+  #
+  # The cost is real and must be carried into any conclusion: runs are NOT bit-reproducible,
+  # and this config gave 0.060782 vs 0.051657 on two identical runs. So a small difference
+  # between two runs cannot be attributed to the change being tested — only a large one can.
+  # The linear baseline does not go through attention and can still be run with "warn" via
+  # --deterministic warn if exact reproducibility matters for it.
+  deterministic: false
+
+  rollout_steps: 0
+  drop_hmi_probability: 0.0        # keep 0: any augmentation would break embedding caching
+  use_latitude_in_learned_flow: false
+  dtype: float32
+
+
+# -----------------------------------------------------------------------------
+# Output
+# -----------------------------------------------------------------------------
+output:
+  ckpt_dir: checkpoints
+  s3_bucket: null
+  s3_prefix: ""
+  s3_best_key: best.ckpt
+
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  wandb_project: solar_wind_regression
+  wandb_entity: null

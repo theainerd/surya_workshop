@@ -43,13 +43,13 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
 from downstream_apps.solar_wind.configs import TrainingConfig, load_solar_wind_config
-from downstream_apps.solar_wind.datasets.solar_wind_dataset_01 import SolarWindDSDataset
+from downstream_apps.solar_wind.datasets.loaders import build_solar_wind_dataloaders
 from downstream_apps.solar_wind.lightning_modules.pl_simple_baseline import SolarWindLightningModule
 from downstream_apps.solar_wind.metrics.template_metrics import SolarWindMetrics
 from workshop_infrastructure.assets import ensure_assets
-from workshop_infrastructure.datasets.builders import build_helio_dataloaders
 from workshop_infrastructure.utils import (
     apply_peft_lora,
+    build_run_name,
     build_scalers,
     load_pretrained_weights,
     UploadBestCheckpointToS3,
@@ -81,6 +81,19 @@ def parse_args() -> argparse.Namespace:
                         help="Override training.max_epochs from the config YAML.")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override training.batch_size from the config YAML.")
+    # These two are what distinguish the three comparison categories from one another, so
+    # they vary run-to-run over a single config rather than justifying a config file each.
+    parser.add_argument("--max-samples", type=int, default=None,
+                        help="Override data.max_samples: cap the TRAINING set only "
+                             "(validation is never touched). This is the axis of the "
+                             "data-amount comparison. Pair it with --train-subsample-seed, "
+                             "or the cap takes a chronological prefix and the amount of data "
+                             "is confounded with which years it covers.")
+    parser.add_argument("--train-subsample-seed", type=int, default=None,
+                        help="Override data.train_subsample_seed: draw the training subset at "
+                             "random (spread over the whole index) instead of taking a "
+                             "chronological prefix. Vary it at fixed --max-samples to build "
+                             "ensemble members that differ in composition but not in size.")
     parser.add_argument("--s3-cache-dir", type=str, default=None,
                         help="Override data.s3_cache_dir (the local cache for S3 reads). "
                              "Handy when the same config runs on machines with different scratch.")
@@ -95,31 +108,14 @@ def parse_args() -> argparse.Namespace:
 def build_datasets(cfg: TrainingConfig, scalers) -> Tuple[DataLoader, DataLoader]:
     """Create train and validation DataLoaders from config.
 
-    Everything generic (channels, temporal sampling, S3 access, worker settings) is
-    handled by build_helio_dataloaders(). Only the solar-wind-specific arguments below are
-    this app's business — when you fork the template, this is the list you replace.
-
-    Solar wind carries two separate OMNI label indices (train/val), unlike the flare
-    template's single shared catalog, so ds_index_path is passed per-split via
-    train_kwargs/val_kwargs rather than as a shared task kwarg.
+    The wiring itself lives in ``datasets/loaders.py`` because the eval and embedding-cache
+    scripts must construct these splits identically — including the target standardization,
+    which is what keeps ``val_loss`` in the same units a checkpoint was trained in.
 
     ``scalers`` is built once in main() and shared with build_model(), so the two paths
     cannot end up with different normalization statistics.
     """
-    return build_helio_dataloaders(
-        cfg,
-        SolarWindDSDataset,
-        scalers=scalers,
-        seed=cfg.seed,
-        return_surya_stack=True,
-        max_number_of_samples=cfg.data.max_samples,
-        ds_time_column=cfg.data.ds_time_column,
-        ds_target_column=cfg.data.ds_target_column,
-        ds_time_tolerance=cfg.data.ds_time_tolerance,
-        ds_match_direction=cfg.data.ds_match_direction,
-        train_kwargs={"ds_index_path": cfg.data.ds_train_index_path},
-        val_kwargs={"ds_index_path": cfg.data.ds_val_index_path},
-    )
+    return build_solar_wind_dataloaders(cfg, scalers)
 
 
 def build_model(cfg: TrainingConfig, scalers, train_baseline: bool = False) -> L.LightningModule:
@@ -183,10 +179,17 @@ def _log_trainable_parameters(model) -> None:
 
 def build_trainer(
     cfg: TrainingConfig,
+    run_name: str,
     no_wandb: bool = False,
     max_epochs_override: int | None = None,
 ) -> Tuple[L.Trainer, ModelCheckpoint]:
-    """Configure loggers, callbacks, and the Lightning Trainer."""
+    """Configure loggers, callbacks, and the Lightning Trainer.
+
+    ``run_name`` (from ``build_run_name()``) names both loggers instead of the bare
+    ``cfg.job_id``, so runs that vary training-set size, composition, or fine-tuning mode
+    land on distinct WandB names and distinct ``runs/<run_name>`` CSV folders rather than
+    colliding into the same name with an opaque version number.
+    """
     max_epochs = max_epochs_override if max_epochs_override is not None else cfg.max_epochs
 
     loggers = []
@@ -194,11 +197,11 @@ def build_trainer(
         loggers.append(WandbLogger(
             entity=cfg.wandb_entity,  # None = personal account; set in YAML for team runs
             project=cfg.wandb_project,
-            name=cfg.job_id,
+            name=run_name,
             log_model=False,
             save_dir=os.environ.get("TMPDIR", "./wandb/wandb_tmp"),
         ))
-    loggers.append(CSVLogger("runs", name=cfg.job_id))
+    loggers.append(CSVLogger("runs", name=run_name))
 
     Path(cfg.output.ckpt_dir).mkdir(parents=True, exist_ok=True)
     checkpoint_cb = ModelCheckpoint(
@@ -231,6 +234,9 @@ def build_trainer(
         logger=loggers,
         callbacks=[checkpoint_cb, upload_cb],
         log_every_n_steps=2,
+        # batch_size=2 makes every step high-variance; clip to guard against a single
+        # bad batch derailing the LoRA adapters / freshly-initialized head.
+        gradient_clip_val=1.0,
     )
     return trainer, checkpoint_cb
 
@@ -250,6 +256,10 @@ def main() -> None:
     L.seed_everything(cfg.seed, workers=True)
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+    if args.max_samples is not None:
+        cfg.data.max_samples = args.max_samples
+    if args.train_subsample_seed is not None:
+        cfg.data.train_subsample_seed = args.train_subsample_seed
     if args.s3_cache_dir is not None:
         cfg.data.s3_cache_dir = args.s3_cache_dir
     if args.deterministic is not None:
@@ -263,7 +273,26 @@ def main() -> None:
 
     train_loader, val_loader = build_datasets(cfg, scalers)
     lit_model = build_model(cfg, scalers, train_baseline=args.train_baseline)
-    trainer, checkpoint_cb = build_trainer(cfg, no_wandb=args.no_wandb, max_epochs_override=args.max_epochs)
+
+    if args.train_baseline:
+        mode = "baseline"
+    elif cfg.model.use_lora:
+        mode = "lora"
+    elif cfg.model.freeze_backbone:
+        mode = "probe"
+    else:
+        mode = "full"
+    run_name = build_run_name(
+        job_id=cfg.job_id,
+        mode=mode,
+        n_train=cfg.data.max_samples if cfg.data.max_samples is not None else "all",
+        max_epochs=args.max_epochs if args.max_epochs is not None else cfg.max_epochs,
+        subsample_seed=cfg.data.train_subsample_seed,
+    )
+    print(f"[RUN] {run_name}")
+    trainer, checkpoint_cb = build_trainer(
+        cfg, run_name, no_wandb=args.no_wandb, max_epochs_override=args.max_epochs
+    )
 
     trainer.fit(lit_model, train_loader, val_loader)
 
